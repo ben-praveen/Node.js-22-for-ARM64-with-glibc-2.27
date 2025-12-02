@@ -1,0 +1,90 @@
+name: Build Node.js ARM64 with glibc 2.27 (Enhanced)
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version (e.g., 22.18.0)'
+        required: true
+        default: '22.18.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      
+      - name: Build in ARM64 container with old glibc
+        run: |
+          # Use actual ARM64 container with Ubuntu 18.04 (glibc 2.27)
+          docker run --rm --platform linux/arm64 -v $PWD:/work -w /work ubuntu:18.04 bash -c '
+            set -ex
+            
+            # Install dependencies
+            apt-get update
+            apt-get install -y wget xz-utils python3 make gcc g++ git curl
+            
+            # Verify we are on glibc 2.27
+            echo "=== glibc version ==="
+            ldd --version
+            
+            # Download Node.js source
+            NODE_VERSION=${{ github.event.inputs.node_version }}
+            wget https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz
+            tar -xzf node-v${NODE_VERSION}.tar.gz
+            cd node-v${NODE_VERSION}
+            
+            # Configure and build
+            ./configure --prefix=/nodejs-install
+            
+            # Build (this will be slow due to QEMU emulation)
+            make -j$(nproc)
+            
+            # Install
+            make install DESTDIR=/work/node-output
+            
+            # Create tarball
+            cd /work/node-output/nodejs-install
+            tar -czf /work/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz .
+            
+            echo "Build completed!"
+          '
+      
+      - name: Verify build
+        run: |
+          echo "=== Build artifact ==="
+          ls -lh *.tar.gz
+          
+          # Extract and check
+          mkdir -p test-extract
+          tar -xzf node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz -C test-extract
+          
+          echo "=== Contents ==="
+          ls -la test-extract/
+          
+          echo "=== Node binary info ==="
+          file test-extract/bin/node
+      
+      - name: Upload Node.js binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227
+          path: node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz
+          retention-days: 30
+      
+      - name: Create summary
+        run: |
+          echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Node.js version: ${{ github.event.inputs.node_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Target: linux-arm64" >> $GITHUB_STEP_SUMMARY
+          echo "- glibc: 2.27 compatible" >> $GITHUB_STEP_SUMMARY
+          echo "- Build time: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the artifact from the Actions tab above." >> $GITHUB_STEP_SUMMARY
