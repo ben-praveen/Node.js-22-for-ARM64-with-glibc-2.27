@@ -1,16 +1,16 @@
-name: Build Node.js ARM64 with glibc 2.27 (Enhanced)
+name: Build Node.js ARM64 with glibc 2.27
 
 on:
   workflow_dispatch:
     inputs:
       node_version:
-        description: 'Node.js version (e.g., 22.18.0)'
+        description: 'Node.js version (e.g., 22.21.1)'
         required: true
-        default: '22.18.0'
+        default: '22.21.1'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     
     steps:
       - name: Checkout
@@ -21,56 +21,103 @@ jobs:
         with:
           platforms: arm64
       
-      - name: Build in ARM64 container with old glibc
+      - name: Build Node.js using proven method
         run: |
-          # Use actual ARM64 container with Ubuntu 18.04 (glibc 2.27)
           docker run --rm --platform linux/arm64 -v $PWD:/work -w /work ubuntu:18.04 bash -c '
-            set -ex
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
             
-            # Install dependencies
+            echo "=== System Information ==="
+            uname -a
+            cat /etc/os-release
+            ldd --version | head -n1
+            
             apt-get update
-            apt-get install -y wget xz-utils python3 make gcc g++ git curl
             
-            # Verify we are on glibc 2.27
-            echo "=== glibc version ==="
-            ldd --version
+            # Basic utilities + repos support
+            apt-get install -y software-properties-common wget git ca-certificates curl xz-utils
+            
+            # Toolchain PPA for GCC 10 and deadsnakes for Python 3.8
+            add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            add-apt-repository -y ppa:deadsnakes/ppa
+            apt-get update
+            
+            # Install compilers + build deps commonly needed by Node.js
+            apt-get install -y gcc-10 g++-10 make build-essential \
+               python3.8 python3.8-dev python3.8-distutils pkg-config libssl-dev \
+               gperf bison xz-utils
+            
+            echo "=== Compiler Versions ==="
+            gcc-10 --version | head -n1
+            g++-10 --version | head -n1
+            python3.8 --version
             
             # Download Node.js source
             NODE_VERSION=${{ github.event.inputs.node_version }}
-            wget https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz
+            echo "=== Downloading Node.js v${NODE_VERSION} ==="
+            cd /tmp
+            wget -q https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz
             tar -xzf node-v${NODE_VERSION}.tar.gz
             cd node-v${NODE_VERSION}
             
-            # Configure and build
-            ./configure --prefix=/nodejs-install
+            # NOTE: Creating swap inside an unprivileged Docker container typically fails.
+            # If build needs more memory, the retry logic below will use single-threaded compilation.
             
-            # Build (this will be slow due to QEMU emulation)
-            make -j$(nproc)
+            echo "=== Configuring Node.js ==="
+            CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 python3.8 configure.py --prefix=/opt/nodejs
             
-            # Install
+            echo "=== Building Node.js ==="
+            echo "Attempting parallel build with $(nproc) cores..."
+            
+            # Try parallel build; if it fails (OOM / QEMU), retry single-threaded
+            set +e
+            CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 make -j$(nproc)
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "⚠️  Parallel build failed (exit $RC). Retrying single-threaded..."
+              CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 make -j1 || exit 1
+            fi
+            set -e
+            
+            echo "=== Installing Node.js ==="
             make install DESTDIR=/work/node-output
             
-            # Create tarball
-            cd /work/node-output/nodejs-install
+            echo "=== Creating tarball ==="
+            cd /work/node-output/opt/nodejs
             tar -czf /work/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz .
             
-            echo "Build completed!"
+            echo ""
+            echo "✅ Build completed successfully!"
+            ls -lh /work/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz
           '
       
       - name: Verify build
         run: |
-          echo "=== Build artifact ==="
-          ls -lh *.tar.gz
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu file
           
-          # Extract and check
           mkdir -p test-extract
           tar -xzf node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz -C test-extract
           
-          echo "=== Contents ==="
-          ls -la test-extract/
-          
-          echo "=== Node binary info ==="
+          echo "=== Architecture Verification ==="
           file test-extract/bin/node
+          
+          ARCH=$(aarch64-linux-gnu-readelf -h test-extract/bin/node | grep Machine | awk '{print $2}')
+          if [[ "$ARCH" == "AArch64" ]]; then
+            echo "✅ Confirmed: ARM64 (aarch64) binary"
+          else
+            echo "❌ ERROR: Not an ARM64 binary!"
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== glibc Requirements ==="
+          echo "Maximum GLIBC version required:"
+          aarch64-linux-gnu-readelf -V test-extract/bin/node | grep "GLIBC_" | sort -V | uniq | tail -3
+          
+          echo ""
+          echo "=== Package Contents ==="
+          ls -lh test-extract/bin/
       
       - name: Upload Node.js binary
         uses: actions/upload-artifact@v4
@@ -81,10 +128,28 @@ jobs:
       
       - name: Create summary
         run: |
-          echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Node.js version: ${{ github.event.inputs.node_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Target: linux-arm64" >> $GITHUB_STEP_SUMMARY
-          echo "- glibc: 2.27 compatible" >> $GITHUB_STEP_SUMMARY
-          echo "- Build time: $(date)" >> $GITHUB_STEP_SUMMARY
+          FILE_SIZE=$(ls -lh node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz | awk '{print $5}')
+          
+          echo "# ✅ Node.js v${{ github.event.inputs.node_version }} ARM64 Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download the artifact from the Actions tab above." >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Package Info" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | v${{ github.event.inputs.node_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | **ARM64** (aarch64) |" >> $GITHUB_STEP_SUMMARY
+          echo "| glibc | **≥ 2.27** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Compiler | GCC 10.5 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Size | ${FILE_SIZE} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ⬇️ Download" >> $GITHUB_STEP_SUMMARY
+          echo 'Scroll to **Artifacts** section and download: `node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz`' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Quick Install" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "tar -xzf node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz" >> $GITHUB_STEP_SUMMARY
+          echo "sudo cp -r bin/* /usr/local/bin/" >> $GITHUB_STEP_SUMMARY
+          echo "sudo cp -r lib/* /usr/local/lib/" >> $GITHUB_STEP_SUMMARY
+          echo "sudo cp -r include/* /usr/local/include/" >> $GITHUB_STEP_SUMMARY
+          echo "sudo cp -r share/* /usr/local/share/" >> $GITHUB_STEP_SUMMARY
+          echo "node --version" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
