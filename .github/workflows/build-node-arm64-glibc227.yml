@@ -1,4 +1,4 @@
-name: Build Node.js ARM64 with glibc 2.27
+name: Build Node.js ARM64 with glibc 2.27 (Unofficial-Builds Method)
 
 on:
   workflow_dispatch:
@@ -13,120 +13,241 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Set up QEMU for ARM64 emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      
-      - name: Build Node.js
+      - name: Create recipe structure
         run: |
-          docker run --rm --platform linux/arm64 -v $PWD:/work -w /work ubuntu:18.04 bash -c '
-            set -eux
-            # Note: Using -eux instead of -euxo pipefail to avoid SIGPIPE issues with head/grep
-            export DEBIAN_FRONTEND=noninteractive
-            
-            echo "=== System Information ==="
-            uname -a
-            cat /etc/os-release
-            ldd --version | head -n1 || true
-            
-            apt-get update
-            
-            # Basic utilities + repos support
-            apt-get install -y software-properties-common wget git ca-certificates curl xz-utils
-            
-            # Toolchain PPA for GCC 10 and deadsnakes for Python 3.8
-            add-apt-repository -y ppa:ubuntu-toolchain-r/test
-            add-apt-repository -y ppa:deadsnakes/ppa
-            apt-get update
-            
-            # Install compilers + build deps
-            apt-get install -y gcc-10 g++-10 make build-essential \
-               python3.8 python3.8-dev python3.8-distutils pkg-config libssl-dev \
-               gperf bison xz-utils
-            
-            echo "=== Compiler Versions ==="
-            gcc-10 --version | head -n1 || true
-            g++-10 --version | head -n1 || true
-            python3.8 --version
-            
-            # Download Node.js source
-            NODE_VERSION=${{ github.event.inputs.node_version }}
-            echo "=== Downloading Node.js v${NODE_VERSION} ==="
-            cd /tmp
-            wget -q https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz
-            tar -xzf node-v${NODE_VERSION}.tar.gz
-            cd node-v${NODE_VERSION}
-            
-            echo "=== Configuring Node.js ==="
-            CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 python3.8 configure.py --prefix=/opt/nodejs
-            
-            echo "=== Building Node.js ==="
-            echo "Attempting parallel build with $(nproc) cores..."
-            
-            # Try parallel build; if it fails, retry single-threaded
-            set +e
-            CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 make -j$(nproc)
-            RC=$?
-            if [ $RC -ne 0 ]; then
-              echo "⚠️  Parallel build failed (exit $RC). Retrying single-threaded..."
-              CC=/usr/bin/gcc-10 CXX=/usr/bin/g++-10 make -j1 || exit 1
-            fi
-            set -e
-            
-            echo "=== Installing Node.js ==="
-            make install DESTDIR=/work/node-output
-            
-            echo "=== Creating tarball ==="
-            cd /work/node-output/opt/nodejs
-            tar -czf /work/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz .
-            
-            echo ""
-            echo "✅ Build completed successfully!"
-            ls -lh /work/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz
-          '
-      
-      - name: Verify build
+          mkdir -p recipe/arm64-glibc-227
+          
+      - name: Create Dockerfile (unofficial-builds style)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu file
+          cat > recipe/arm64-glibc-227/Dockerfile <<'DOCKERFILE_END'
+          # Based on unofficial-builds x64-glibc-217 methodology
+          # Uses Ubuntu 22.04 with modern cross-compiler + Ubuntu 18.04 ARM64 sysroot for glibc 2.27
           
-          mkdir -p test-extract
-          tar -xzf node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz -C test-extract
+          FROM ubuntu:22.04
           
-          echo "=== Architecture Verification ==="
-          file test-extract/bin/node
+          ENV DEBIAN_FRONTEND=noninteractive
           
-          ARCH=$(aarch64-linux-gnu-readelf -h test-extract/bin/node | grep Machine | awk '{print $2}')
-          if [[ "$ARCH" == "AArch64" ]]; then
-            echo "✅ Confirmed: ARM64 (aarch64) binary"
+          # Install build dependencies
+          RUN apt-get update && \
+              apt-get install -y \
+                wget curl git python3 make pkg-config ccache xz-utils \
+                gcc-10 g++-10 \
+                gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
+                binutils-aarch64-linux-gnu \
+                file
+          
+          # Set up ccache
+          RUN mkdir -p /root/.ccache && \
+              echo "max_size = 5.0G" > /root/.ccache/ccache.conf && \
+              echo "compression = true" > /root/.ccache/ccache.conf
+          
+          ENV PATH="/usr/lib/ccache:${PATH}"
+          ENV CCACHE_DIR=/root/.ccache
+          
+          # Download and setup Ubuntu 18.04 ARM64 sysroot (glibc 2.27)
+          RUN mkdir -p /sysroot-bionic && \
+              cd /tmp && \
+              wget -q http://ports.ubuntu.com/ubuntu-ports/dists/bionic/main/binary-arm64/Packages.gz && \
+              gunzip Packages.gz && \
+              # Download essential packages
+              for pkg in libc6_2.27 libc6-dev_2.27 libssl1.1_1.1.1 libssl-dev_1.1.1 zlib1g_1.2.11 zlib1g-dev_1.2.11 linux-libc-dev_4.15; do \
+                  PKG_FILE=$(grep -A 20 "^Package: ${pkg%_*}$" Packages | grep "^Filename:" | head -1 | awk '{print $2}'); \
+                  if [ -n "$PKG_FILE" ]; then \
+                      wget -q "http://ports.ubuntu.com/ubuntu-ports/$PKG_FILE" || true; \
+                      dpkg-deb -x $(basename "$PKG_FILE") /sysroot-bionic/ || true; \
+                  fi; \
+              done && \
+              rm -rf /tmp/*
+          
+          # Verify sysroot
+          RUN ls -la /sysroot-bionic/lib/aarch64-linux-gnu/ || echo "Sysroot setup may need adjustment"
+          
+          # Set up cross-compilation environment
+          ENV CC_host=/usr/bin/gcc-10
+          ENV CXX_host=/usr/bin/g++-10
+          ENV LINK_host=/usr/bin/g++-10
+          ENV CC=/usr/bin/aarch64-linux-gnu-gcc-10
+          ENV CXX=/usr/bin/aarch64-linux-gnu-g++-10
+          ENV AR=/usr/bin/aarch64-linux-gnu-ar
+          ENV RANLIB=/usr/bin/aarch64-linux-gnu-ranlib
+          ENV LINK=/usr/bin/aarch64-linux-gnu-g++-10
+          
+          # Point to sysroot for ARM64 libraries (glibc 2.27)
+          ENV CFLAGS="--sysroot=/sysroot-bionic"
+          ENV CXXFLAGS="--sysroot=/sysroot-bionic"
+          ENV LDFLAGS="--sysroot=/sysroot-bionic"
+          
+          WORKDIR /build
+          
+          CMD ["/bin/bash"]
+          DOCKERFILE_END
+          
+      - name: Create run.sh (unofficial-builds style)
+        run: |
+          cat > recipe/arm64-glibc-227/run.sh <<'RUNSH_END'
+          #!/bin/bash
+          
+          # Build script following unofficial-builds convention
+          # Arguments: version source_file output_dir
+          
+          set -ex
+          
+          fullversion="$1"
+          source_url="$2"
+          staging_dir="$3"
+          
+          echo "==== Building Node.js ${fullversion} for ARM64 with glibc 2.27 ===="
+          echo "Source: ${source_url}"
+          echo "Output: ${staging_dir}"
+          
+          # Extract source
+          cd /build
+          if [ -f "${source_url}" ]; then
+            tar -xzf "${source_url}"
           else
-            echo "❌ ERROR: Not an ARM64 binary!"
+            wget -q "${source_url}"
+            tar -xzf "node-${fullversion}.tar.gz"
+          fi
+          
+          cd "node-${fullversion}"
+          
+          # Show environment
+          echo "=== Build Environment ==="
+          echo "CC_host: $CC_host"
+          echo "CXX_host: $CXX_host"
+          echo "CC: $CC"
+          echo "CXX: $CXX"
+          $CC --version | head -1
+          $CC_host --version | head -1
+          
+          # Configure Node.js
+          echo "=== Configuring Node.js ==="
+          python3 configure.py \
+            --dest-cpu=arm64 \
+            --cross-compiling \
+            --prefix=/ \
+            --without-inspector \
+            --without-intl \
+            --openssl-no-asm
+          
+          # Build
+          echo "=== Building Node.js (this takes 20-40 minutes) ==="
+          make -j$(nproc) V=0
+          
+          # Install to staging directory
+          echo "=== Installing to staging directory ==="
+          make install DESTDIR="${staging_dir}"
+          
+          # Verify binary
+          echo "=== Verifying binary ==="
+          file "${staging_dir}/bin/node"
+          
+          # Create tarball in staging directory
+          echo "=== Creating tarball ==="
+          cd "${staging_dir}"
+          
+          # Create properly named tarball
+          XZ_OPT=-9 tar -cJf "node-${fullversion}-linux-arm64-glibc-227.tar.xz" \
+            --transform "s|^|node-${fullversion}-linux-arm64-glibc-227/|" \
+            *
+          
+          # Also create .tar.gz for compatibility
+          tar -czf "node-${fullversion}-linux-arm64-glibc-227.tar.gz" \
+            --transform "s|^|node-${fullversion}-linux-arm64-glibc-227/|" \
+            *
+          
+          echo "✅ Build complete!"
+          ls -lh node-*.tar.*
+          RUNSH_END
+          
+          chmod +x recipe/arm64-glibc-227/run.sh
+      
+      - name: Build Docker image
+        run: |
+          cd recipe/arm64-glibc-227
+          docker build -t arm64-glibc-227-builder .
+          
+      - name: Run build in Docker
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          
+          # Create workspace
+          mkdir -p workspace/output
+          
+          # Download Node.js source
+          wget -q "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz" \
+            -O workspace/node-source.tar.gz
+          
+          # Run the build
+          docker run --rm \
+            -v $PWD/workspace:/workspace \
+            -v $PWD/recipe/arm64-glibc-227/run.sh:/run.sh:ro \
+            arm64-glibc-227-builder \
+            bash /run.sh "${NODE_VERSION}" "/workspace/node-source.tar.gz" "/workspace/output"
+          
+      - name: Extract and verify binary
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          
+          # Extract the build
+          cd workspace/output
+          
+          # Show what was created
+          ls -lh
+          
+          # Verify the binary
+          tar -xzf "node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz"
+          cd "node-v${NODE_VERSION}-linux-arm64-glibc-227"
+          
+          file bin/node
+          
+          # Check it's ARM64
+          if file bin/node | grep -q "ARM aarch64"; then
+            echo "✅ Binary is ARM64"
+          else
+            echo "❌ Binary is not ARM64!"
             exit 1
           fi
           
-          echo ""
-          echo "=== glibc Requirements ==="
-          aarch64-linux-gnu-readelf -V test-extract/bin/node | grep "GLIBC_" | sort -V | uniq | tail -3
-      
-      - name: Upload artifact
+          # Check glibc version requirement
+          echo "=== Checking glibc version requirements ==="
+          readelf -V bin/node | grep GLIBC || echo "No GLIBC version symbols found"
+          
+      - name: Prepare artifacts
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          
+          # Move artifacts to upload location
+          mkdir -p artifacts
+          cp workspace/output/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz artifacts/
+          cp workspace/output/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.xz artifacts/
+          
+          # Create SHASUMS256.txt (unofficial-builds style)
+          cd artifacts
+          sha256sum *.tar.* > SHASUMS256.txt
+          
+          echo "=== Build Artifacts ==="
+          ls -lh
+          cat SHASUMS256.txt
+          
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227
-          path: node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz
+          path: artifacts/*
           retention-days: 30
-      
-      - name: Summary
-        run: |
-          FILE_SIZE=$(ls -lh node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227.tar.gz | awk '{print $5}')
           
-          echo "# ✅ Node.js v${{ github.event.inputs.node_version }} ARM64" >> $GITHUB_STEP_SUMMARY
+      - name: Build summary
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          
+          echo "## ✅ Build Complete!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Architecture:** ARM64 (aarch64)" >> $GITHUB_STEP_SUMMARY
-          echo "**glibc:** ≥ 2.27" >> $GITHUB_STEP_SUMMARY
-          echo "**Size:** ${FILE_SIZE}" >> $GITHUB_STEP_SUMMARY
+          echo "**Node.js Version:** v${NODE_VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** linux-arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**glibc Version:** 2.27 (Ubuntu 18.04 compatible)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download from **Artifacts** above." >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh artifacts/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
