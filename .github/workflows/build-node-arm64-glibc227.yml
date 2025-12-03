@@ -11,6 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
     
     steps:
       - name: Create recipe structure
@@ -106,10 +107,10 @@ jobs:
             tar -xzf "${source_url}"
           else
             wget -q "${source_url}"
-            tar -xzf "node-${fullversion}.tar.gz"
+            tar -xzf "node-v${fullversion}.tar.gz"
           fi
           
-          cd "node-${fullversion}"
+          cd "node-v${fullversion}"
           
           # Show environment
           echo "=== Build Environment ==="
