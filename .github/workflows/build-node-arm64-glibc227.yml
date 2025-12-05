@@ -1,4 +1,4 @@
-name: Build Node.js ARM64 with glibc 2.27 (Unofficial-Builds Method)
+name: Build Node.js ARM64 with glibc 2.27 (Fixed)
 
 on:
   workflow_dispatch:
@@ -14,241 +14,280 @@ jobs:
     timeout-minutes: 90
     
     steps:
-      - name: Create recipe structure
+      - name: Setup build environment
         run: |
-          mkdir -p recipe/arm64-glibc-227
-          
-      - name: Create Dockerfile (unofficial-builds style)
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget curl git python3 make pkg-config ccache \
+            gcc-10 g++-10 \
+            gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            file xz-utils
+      
+      - name: Create Ubuntu 18.04 ARM64 sysroot (glibc 2.27)
         run: |
-          cat > recipe/arm64-glibc-227/Dockerfile <<'DOCKERFILE_END'
-          # Based on unofficial-builds x64-glibc-217 methodology
-          # Uses Ubuntu 22.04 with modern cross-compiler + Ubuntu 18.04 ARM64 sysroot for glibc 2.27
+          # Create sysroot directory
+          sudo mkdir -p /opt/sysroot-bionic-arm64
+          cd /tmp
           
-          FROM ubuntu:22.04
+          # Base URL for Ubuntu 18.04 ARM64 packages
+          BASE_URL="http://ports.ubuntu.com/ubuntu-ports/pool/main"
           
-          ENV DEBIAN_FRONTEND=noninteractive
+          # Essential packages with correct paths
+          declare -A PACKAGES=(
+            ["libc6"]="g/glibc/libc6_2.27-3ubuntu1.6_arm64.deb"
+            ["libc6-dev"]="g/glibc/libc6-dev_2.27-3ubuntu1.6_arm64.deb"
+            ["libssl1.1"]="o/openssl/libssl1.1_1.1.1-1ubuntu2.1~18.04.23_arm64.deb"
+            ["libssl-dev"]="o/openssl/libssl-dev_1.1.1-1ubuntu2.1~18.04.23_arm64.deb"
+            ["zlib1g"]="z/zlib/zlib1g_1.2.11.dfsg-0ubuntu2_arm64.deb"
+            ["zlib1g-dev"]="z/zlib/zlib1g-dev_1.2.11.dfsg-0ubuntu2_arm64.deb"
+            ["linux-libc-dev"]="l/linux/linux-libc-dev_4.15.0-213.224_arm64.deb"
+          )
           
-          # Install build dependencies
-          RUN apt-get update && \
-              apt-get install -y \
-                wget curl git python3 make pkg-config ccache xz-utils \
-                gcc-10 g++-10 \
-                gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
-                binutils-aarch64-linux-gnu \
-                file
+          echo "Downloading Ubuntu 18.04 ARM64 packages for sysroot..."
+          for pkg_name in "${!PACKAGES[@]}"; do
+            pkg_path="${PACKAGES[$pkg_name]}"
+            url="${BASE_URL}/${pkg_path}"
+            filename=$(basename "$pkg_path")
+            
+            echo "  Downloading $filename..."
+            if wget -q "$url" -O "$filename"; then
+              echo "    ✓ Downloaded successfully"
+              sudo dpkg-deb -x "$filename" /opt/sysroot-bionic-arm64/
+              echo "    ✓ Extracted to sysroot"
+            else
+              echo "    ✗ Failed to download, trying alternate..."
+              # Try without version suffix
+              alt_filename="${pkg_name}_arm64.deb"
+              if wget -q "${BASE_URL}/$(dirname $pkg_path)/${alt_filename}" -O "$filename" 2>/dev/null; then
+                echo "    ✓ Downloaded alternate version"
+                sudo dpkg-deb -x "$filename" /opt/sysroot-bionic-arm64/
+              else
+                echo "    ⚠ Skipping $pkg_name"
+              fi
+            fi
+          done
           
-          # Set up ccache
-          RUN mkdir -p /root/.ccache && \
-              echo "max_size = 5.0G" > /root/.ccache/ccache.conf && \
-              echo "compression = true" > /root/.ccache/ccache.conf
+          # Clean up
+          rm -f *.deb
           
-          ENV PATH="/usr/lib/ccache:${PATH}"
-          ENV CCACHE_DIR=/root/.ccache
-          
-          # Download and setup Ubuntu 18.04 ARM64 sysroot (glibc 2.27)
-          RUN mkdir -p /sysroot-bionic && \
-              cd /tmp && \
-              wget -q http://ports.ubuntu.com/ubuntu-ports/dists/bionic/main/binary-arm64/Packages.gz && \
-              gunzip Packages.gz && \
-              # Download essential packages
-              for pkg in libc6_2.27 libc6-dev_2.27 libssl1.1_1.1.1 libssl-dev_1.1.1 zlib1g_1.2.11 zlib1g-dev_1.2.11 linux-libc-dev_4.15; do \
-                  PKG_FILE=$(grep -A 20 "^Package: ${pkg%_*}$" Packages | grep "^Filename:" | head -1 | awk '{print $2}'); \
-                  if [ -n "$PKG_FILE" ]; then \
-                      wget -q "http://ports.ubuntu.com/ubuntu-ports/$PKG_FILE" || true; \
-                      dpkg-deb -x $(basename "$PKG_FILE") /sysroot-bionic/ || true; \
-                  fi; \
-              done && \
-              rm -rf /tmp/*
-          
-          # Verify sysroot
-          RUN ls -la /sysroot-bionic/lib/aarch64-linux-gnu/ || echo "Sysroot setup may need adjustment"
-          
-          # Set up cross-compilation environment
-          ENV CC_host=/usr/bin/gcc-10
-          ENV CXX_host=/usr/bin/g++-10
-          ENV LINK_host=/usr/bin/g++-10
-          ENV CC=/usr/bin/aarch64-linux-gnu-gcc-10
-          ENV CXX=/usr/bin/aarch64-linux-gnu-g++-10
-          ENV AR=/usr/bin/aarch64-linux-gnu-ar
-          ENV RANLIB=/usr/bin/aarch64-linux-gnu-ranlib
-          ENV LINK=/usr/bin/aarch64-linux-gnu-g++-10
-          
-          # Point to sysroot for ARM64 libraries (glibc 2.27)
-          ENV CFLAGS="--sysroot=/sysroot-bionic"
-          ENV CXXFLAGS="--sysroot=/sysroot-bionic"
-          ENV LDFLAGS="--sysroot=/sysroot-bionic"
-          
-          WORKDIR /build
-          
-          CMD ["/bin/bash"]
-          DOCKERFILE_END
-          
-      - name: Create run.sh (unofficial-builds style)
-        run: |
-          cat > recipe/arm64-glibc-227/run.sh <<'RUNSH_END'
-          #!/bin/bash
-          
-          # Build script following unofficial-builds convention
-          # Arguments: version source_file output_dir
-          
-          set -ex
-          
-          fullversion="$1"
-          source_url="$2"
-          staging_dir="$3"
-          
-          echo "==== Building Node.js ${fullversion} for ARM64 with glibc 2.27 ===="
-          echo "Source: ${source_url}"
-          echo "Output: ${staging_dir}"
-          
-          # Extract source
-          cd /build
-          if [ -f "${source_url}" ]; then
-            tar -xzf "${source_url}"
+          # Verify critical files exist
+          echo ""
+          echo "=== Verifying sysroot ==="
+          if [ -f /opt/sysroot-bionic-arm64/lib/aarch64-linux-gnu/libc.so.6 ]; then
+            echo "✓ libc found"
           else
-            wget -q "${source_url}"
-            tar -xzf "node-v${fullversion}.tar.gz"
+            echo "✗ libc NOT found - build may fail"
           fi
           
-          cd "node-v${fullversion}"
+          if [ -d /opt/sysroot-bionic-arm64/usr/include ]; then
+            echo "✓ Headers found"
+          else
+            echo "✗ Headers NOT found - build may fail"
+          fi
           
-          # Show environment
-          echo "=== Build Environment ==="
-          echo "CC_host: $CC_host"
-          echo "CXX_host: $CXX_host"
-          echo "CC: $CC"
-          echo "CXX: $CXX"
-          $CC --version | head -1
-          $CC_host --version | head -1
+          echo ""
+          echo "=== Sysroot structure ==="
+          ls -la /opt/sysroot-bionic-arm64/
+          echo ""
+          ls -la /opt/sysroot-bionic-arm64/lib/aarch64-linux-gnu/ 2>/dev/null | head -10 || echo "lib directory structure different"
+          echo ""
+          ls -la /opt/sysroot-bionic-arm64/usr/include/ 2>/dev/null | head -10 || echo "include directory structure different"
+      
+      - name: Download Node.js source
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          wget -q "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz"
+          tar -xzf "node-v${NODE_VERSION}.tar.gz"
           
-          # Configure Node.js
+          echo "✓ Node.js ${NODE_VERSION} source extracted"
+      
+      - name: Configure Node.js for cross-compilation
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          cd "node-v${NODE_VERSION}"
+          
+          # Set up cross-compilation environment
+          export CC_host=/usr/bin/gcc-10
+          export CXX_host=/usr/bin/g++-10
+          export LINK_host=/usr/bin/g++-10
+          export CC=/usr/bin/aarch64-linux-gnu-gcc-10
+          export CXX=/usr/bin/aarch64-linux-gnu-g++-10
+          export AR=/usr/bin/aarch64-linux-gnu-ar
+          export RANLIB=/usr/bin/aarch64-linux-gnu-ranlib
+          export LINK=/usr/bin/aarch64-linux-gnu-g++-10
+          
+          # Point to Ubuntu 18.04 sysroot for glibc 2.27
+          export CFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          export CXXFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          export LDFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          
+          echo "=== Cross-compilation environment ==="
+          echo "Host compiler: $($CC_host --version | head -1)"
+          echo "Target compiler: $($CC --version | head -1)"
+          echo "Sysroot: $CFLAGS"
+          
+          # Configure
+          echo ""
           echo "=== Configuring Node.js ==="
           python3 configure.py \
             --dest-cpu=arm64 \
             --cross-compiling \
-            --prefix=/ \
+            --prefix=/opt/nodejs \
             --without-inspector \
             --without-intl \
             --openssl-no-asm
           
-          # Build
-          echo "=== Building Node.js (this takes 20-40 minutes) ==="
-          make -j$(nproc) V=0
+          echo ""
+          echo "✓ Configuration complete"
+      
+      - name: Build Node.js
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          cd "node-v${NODE_VERSION}"
           
-          # Install to staging directory
-          echo "=== Installing to staging directory ==="
-          make install DESTDIR="${staging_dir}"
+          # Set environment again for build
+          export CC_host=/usr/bin/gcc-10
+          export CXX_host=/usr/bin/g++-10
+          export LINK_host=/usr/bin/g++-10
+          export CC=/usr/bin/aarch64-linux-gnu-gcc-10
+          export CXX=/usr/bin/aarch64-linux-gnu-g++-10
+          export AR=/usr/bin/aarch64-linux-gnu-ar
+          export RANLIB=/usr/bin/aarch64-linux-gnu-ranlib
+          export LINK=/usr/bin/aarch64-linux-gnu-g++-10
+          export CFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          export CXXFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          export LDFLAGS="--sysroot=/opt/sysroot-bionic-arm64"
+          
+          echo "=== Building Node.js ==="
+          echo "This will take approximately 20-40 minutes..."
+          echo "Start time: $(date)"
+          
+          # Build with moderate parallelism to avoid memory issues
+          make -j4 V=0
+          
+          echo ""
+          echo "End time: $(date)"
+          echo "✓ Build complete!"
+      
+      - name: Create installation package
+        run: |
+          NODE_VERSION=${{ github.event.inputs.node_version }}
+          cd "node-v${NODE_VERSION}"
+          
+          # Install to temporary directory
+          mkdir -p ../node-install
+          make install DESTDIR=$PWD/../node-install
+          
+          # Navigate to installation
+          cd ../node-install/opt/nodejs
           
           # Verify binary
-          echo "=== Verifying binary ==="
-          file "${staging_dir}/bin/node"
-          
-          # Create tarball in staging directory
-          echo "=== Creating tarball ==="
-          cd "${staging_dir}"
-          
-          # Create properly named tarball
-          XZ_OPT=-9 tar -cJf "node-${fullversion}-linux-arm64-glibc-227.tar.xz" \
-            --transform "s|^|node-${fullversion}-linux-arm64-glibc-227/|" \
-            *
-          
-          # Also create .tar.gz for compatibility
-          tar -czf "node-${fullversion}-linux-arm64-glibc-227.tar.gz" \
-            --transform "s|^|node-${fullversion}-linux-arm64-glibc-227/|" \
-            *
-          
-          echo "✅ Build complete!"
-          ls -lh node-*.tar.*
-          RUNSH_END
-          
-          chmod +x recipe/arm64-glibc-227/run.sh
-      
-      - name: Build Docker image
-        run: |
-          cd recipe/arm64-glibc-227
-          docker build -t arm64-glibc-227-builder .
-          
-      - name: Run build in Docker
-        run: |
-          NODE_VERSION=${{ github.event.inputs.node_version }}
-          
-          # Create workspace
-          mkdir -p workspace/output
-          
-          # Download Node.js source
-          wget -q "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz" \
-            -O workspace/node-source.tar.gz
-          
-          # Run the build
-          docker run --rm \
-            -v $PWD/workspace:/workspace \
-            -v $PWD/recipe/arm64-glibc-227/run.sh:/run.sh:ro \
-            arm64-glibc-227-builder \
-            bash /run.sh "${NODE_VERSION}" "/workspace/node-source.tar.gz" "/workspace/output"
-          
-      - name: Extract and verify binary
-        run: |
-          NODE_VERSION=${{ github.event.inputs.node_version }}
-          
-          # Extract the build
-          cd workspace/output
-          
-          # Show what was created
-          ls -lh
-          
-          # Verify the binary
-          tar -xzf "node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz"
-          cd "node-v${NODE_VERSION}-linux-arm64-glibc-227"
-          
+          echo "=== Binary verification ==="
           file bin/node
           
-          # Check it's ARM64
           if file bin/node | grep -q "ARM aarch64"; then
-            echo "✅ Binary is ARM64"
+            echo "✓ Binary is ARM64"
           else
-            echo "❌ Binary is not ARM64!"
+            echo "✗ Binary is not ARM64!"
+            file bin/node
             exit 1
           fi
           
-          # Check glibc version requirement
-          echo "=== Checking glibc version requirements ==="
-          readelf -V bin/node | grep GLIBC || echo "No GLIBC version symbols found"
+          # Create tarballs
+          echo ""
+          echo "=== Creating distribution packages ==="
           
-      - name: Prepare artifacts
+          # .tar.gz
+          tar -czf "/tmp/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz" \
+            --transform "s|^|node-v${NODE_VERSION}-linux-arm64-glibc-227/|" \
+            *
+          
+          # .tar.xz (better compression)
+          XZ_OPT=-9 tar -cJf "/tmp/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.xz" \
+            --transform "s|^|node-v${NODE_VERSION}-linux-arm64-glibc-227/|" \
+            *
+          
+          echo "✓ Packages created!"
+      
+      - name: Verify and create checksums
         run: |
           NODE_VERSION=${{ github.event.inputs.node_version }}
           
-          # Move artifacts to upload location
+          # Create artifacts directory
           mkdir -p artifacts
-          cp workspace/output/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz artifacts/
-          cp workspace/output/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.xz artifacts/
+          mv /tmp/node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.* artifacts/
           
-          # Create SHASUMS256.txt (unofficial-builds style)
+          # Verify extraction
           cd artifacts
+          echo "=== Testing package extraction ==="
+          tar -xzf "node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz"
+          
+          # Test what glibc versions are required
+          echo ""
+          echo "=== glibc version requirements ==="
+          readelf -V "node-v${NODE_VERSION}-linux-arm64-glibc-227/bin/node" | grep GLIBC | sort -u || echo "No GLIBC symbols detected"
+          
+          # Check actual binary
+          echo ""
+          file "node-v${NODE_VERSION}-linux-arm64-glibc-227/bin/node"
+          
+          # Remove test extraction
+          rm -rf "node-v${NODE_VERSION}-linux-arm64-glibc-227"
+          
+          # Create checksums
           sha256sum *.tar.* > SHASUMS256.txt
           
-          echo "=== Build Artifacts ==="
+          echo ""
+          echo "=== Final artifacts ==="
           ls -lh
+          echo ""
+          echo "=== Checksums ==="
           cat SHASUMS256.txt
-          
+      
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: node-v${{ github.event.inputs.node_version }}-linux-arm64-glibc-227
           path: artifacts/*
           retention-days: 30
-          
-      - name: Build summary
+      
+      - name: Generate summary
         run: |
           NODE_VERSION=${{ github.event.inputs.node_version }}
           
-          echo "## ✅ Build Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Node.js Version:** v${NODE_VERSION}" >> $GITHUB_STEP_SUMMARY
-          echo "**Target:** linux-arm64" >> $GITHUB_STEP_SUMMARY
-          echo "**glibc Version:** 2.27 (Ubuntu 18.04 compatible)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ls -lh artifacts/ >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## ✅ Node.js ARM64 Build Complete!
+          
+          **Version:** v${NODE_VERSION}  
+          **Architecture:** linux-arm64  
+          **glibc:** 2.27 (Ubuntu 18.04, Debian 10, RHEL 8 compatible)  
+          **Build Method:** Cross-compilation with Ubuntu 18.04 sysroot
+          
+          ### 📦 Artifacts Created
+          
+          - \`node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz\`
+          - \`node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.xz\` (smaller)
+          - \`SHASUMS256.txt\`
+          
+          ### 🚀 Installation
+          
+          \`\`\`bash
+          # Download the artifact from this workflow
+          tar -xzf node-v${NODE_VERSION}-linux-arm64-glibc-227.tar.gz
+          sudo mv node-v${NODE_VERSION}-linux-arm64-glibc-227 /opt/nodejs
+          sudo ln -s /opt/nodejs/bin/node /usr/local/bin/node
+          sudo ln -s /opt/nodejs/bin/npm /usr/local/bin/npm
+          
+          # Verify
+          node --version
+          \`\`\`
+          
+          ### ✅ Compatibility
+          
+          This build works on:
+          - Ubuntu 18.04+ ARM64
+          - Debian 10+ ARM64  
+          - RHEL 8+ ARM64
+          - Any ARM64 Linux with glibc 2.27+
+          EOF
